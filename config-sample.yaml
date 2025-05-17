@@ -1,0 +1,7 @@
+client_id:        "xxx.apps.googleusercontent.com"
+client_secret:    "xxxx"
+refresh_token:    "1//xxxx"
+device_id:        "enterprises/xxxx/devices/xxxx"
+output_dir:           "/app/cam/nest"
+segment_seconds:      600
+extend_margin_seconds: 30

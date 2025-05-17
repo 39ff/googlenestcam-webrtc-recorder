@@ -1,0 +1,15 @@
+version: "3.9"
+services:
+  nest-recorder:
+    build: .
+    container_name: nest-recorder
+    restart: unless-stopped
+    environment:
+      TZ: "Asia/Tokyo"
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - ./recordings:/app/mp4
+    # UDP/NAT
+    # network_mode: host
+    # ports:
+    #   - "5000-5100:5000-5100/udp"
