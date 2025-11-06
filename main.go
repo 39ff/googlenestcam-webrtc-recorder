@@ -182,6 +182,9 @@ type Recorder struct {
 	mu             sync.Mutex // protect ffmpeg start
 
 	startOnce sync.Once
+	errorChan chan error // notify RTP errors to main loop
+	ctx       context.Context
+	cancel    context.CancelFunc
 	// ------------------------------------------------------------------
 }
 
@@ -297,14 +300,33 @@ func (r *Recorder) startFFMPEG() error {
 	// ---------------- RTP forwarding goroutines -------------------------
 	go func() {
 		for {
+			select {
+			case <-r.ctx.Done():
+				log.Println("[RTC] video forwarder stopped by context")
+				return
+			default:
+			}
+
 			pkt, _, err := r.videoTrack.ReadRTP()
 			if err != nil {
 				log.Println("[RTC] video ReadRTP:", err)
+				select {
+				case r.errorChan <- fmt.Errorf("video ReadRTP: %w", err):
+				default:
+				}
 				return
 			}
-			raw, _ := pkt.Marshal()
+			raw, err := pkt.Marshal()
+			if err != nil {
+				log.Println("[RTC] video Marshal:", err)
+				continue
+			}
 			if _, err = r.videoUDP.Write(raw); err != nil {
 				log.Println("[UDP] video write:", err)
+				select {
+				case r.errorChan <- fmt.Errorf("video UDP write: %w", err):
+				default:
+				}
 				return
 			}
 		}
@@ -312,14 +334,33 @@ func (r *Recorder) startFFMPEG() error {
 
 	go func() {
 		for {
+			select {
+			case <-r.ctx.Done():
+				log.Println("[RTC] audio forwarder stopped by context")
+				return
+			default:
+			}
+
 			pkt, _, err := r.audioTrack.ReadRTP()
 			if err != nil {
 				log.Println("[RTC] audio ReadRTP:", err)
+				select {
+				case r.errorChan <- fmt.Errorf("audio ReadRTP: %w", err):
+				default:
+				}
 				return
 			}
-			raw, _ := pkt.Marshal()
+			raw, err := pkt.Marshal()
+			if err != nil {
+				log.Println("[RTC] audio Marshal:", err)
+				continue
+			}
 			if _, err = r.audioUDP.Write(raw); err != nil {
 				log.Println("[UDP] audio write:", err)
+				select {
+				case r.errorChan <- fmt.Errorf("audio UDP write: %w", err):
+				default:
+				}
 				return
 			}
 		}
@@ -351,6 +392,19 @@ func (r *Recorder) negotiate(ctx context.Context) error {
 		webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly},
 	)
 	_, _ = pc.CreateDataChannel("data", nil)
+
+	// ---- OnConnectionStateChange ----------------------------------------
+	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		log.Printf("[RTC] connection state: %s", state.String())
+		if state == webrtc.PeerConnectionStateFailed ||
+			state == webrtc.PeerConnectionStateDisconnected ||
+			state == webrtc.PeerConnectionStateClosed {
+			select {
+			case r.errorChan <- fmt.Errorf("peer connection state: %s", state.String()):
+			default:
+			}
+		}
+	})
 
 	// ---- OnTrack -------------------------------------------------------
 	pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
@@ -435,6 +489,9 @@ func (r *Recorder) extend(ctx context.Context) error {
 }
 
 func (r *Recorder) close() {
+	if r.cancel != nil {
+		r.cancel() // stop goroutines
+	}
 	if r.pc != nil {
 		_ = r.pc.Close()
 	}
@@ -474,7 +531,13 @@ func main() {
 		default:
 		}
 
-		rec := &Recorder{}
+		recCtx, recCancel := context.WithCancel(ctx)
+		rec := &Recorder{
+			errorChan: make(chan error, 2), // buffer for video + audio errors
+			ctx:       recCtx,
+			cancel:    recCancel,
+		}
+
 		if err := rec.negotiate(ctx); err != nil {
 			log.Println("[ERROR] negotiate:", err)
 			rec.close()
@@ -482,27 +545,37 @@ func main() {
 			continue
 		}
 
+		// Inner loop: extend stream and monitor for errors
+	extendLoop:
 		for {
 			wait := time.Until(rec.streamExpires.Add(
 				-time.Duration(cfg.ExtendMarginSeconds) * time.Second))
-			if wait > 0 {
-				time.Sleep(wait)
+
+			// If already expired or close to expiry, extend immediately
+			if wait <= 0 {
+				if err := rec.extend(ctx); err != nil {
+					log.Println("[WARN] extend failed:", err, "→ renegotiate")
+					rec.close()
+					break extendLoop
+				}
+				continue
 			}
 
+			// Wait for either: timeout, signal, or RTP error
 			select {
 			case <-sig:
 				log.Println("Exiting by signal")
-				return
-			default:
-			}
-
-			if err := rec.extend(ctx); err != nil {
-				log.Println("[WARN] extend failed:", err, "→ renegotiate")
 				rec.close()
-				break
+				return
+			case rtpErr := <-rec.errorChan:
+				log.Printf("[ERROR] RTP stream failed: %v → renegotiate", rtpErr)
+				rec.close()
+				break extendLoop
+			case <-time.After(wait):
+				// Time to extend - loop back to top
 			}
 		}
-		rec.close()
+
 		time.Sleep(10 * time.Second)
 	}
 }
