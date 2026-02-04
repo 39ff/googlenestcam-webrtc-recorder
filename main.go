@@ -492,6 +492,10 @@ func (r *Recorder) close() {
 	if r.cancel != nil {
 		r.cancel() // stop goroutines
 	}
+	// Note: errorChan is intentionally not closed here.
+	// Goroutines may still attempt to send after cancel/pc.Close,
+	// and sending on a closed channel would panic. The channel
+	// will be garbage collected when all references are released.
 	if r.pc != nil {
 		_ = r.pc.Close()
 	}
@@ -533,12 +537,12 @@ func main() {
 
 		recCtx, recCancel := context.WithCancel(ctx)
 		rec := &Recorder{
-			errorChan: make(chan error, 2), // buffer for video + audio errors
+			errorChan: make(chan error, 3), // buffer for video + audio + connection state errors
 			ctx:       recCtx,
 			cancel:    recCancel,
 		}
 
-		if err := rec.negotiate(ctx); err != nil {
+		if err := rec.negotiate(recCtx); err != nil {
 			log.Println("[ERROR] negotiate:", err)
 			rec.close()
 			time.Sleep(10 * time.Second)
@@ -553,12 +557,27 @@ func main() {
 
 			// If already expired or close to expiry, extend immediately
 			if wait <= 0 {
-				if err := rec.extend(ctx); err != nil {
-					log.Println("[WARN] extend failed:", err, "→ renegotiate")
+				extendErr := make(chan error, 1)
+				go func() {
+					extendErr <- rec.extend(recCtx)
+				}()
+				select {
+				case err := <-extendErr:
+					if err != nil {
+						log.Println("[WARN] extend failed:", err, "→ renegotiate")
+						rec.close()
+						break extendLoop
+					}
+					continue
+				case <-sig:
+					log.Println("Exiting by signal")
+					rec.close()
+					return
+				case rtpErr := <-rec.errorChan:
+					log.Printf("[ERROR] RTP stream failed: %v → renegotiate", rtpErr)
 					rec.close()
 					break extendLoop
 				}
-				continue
 			}
 
 			// Wait for either: timeout, signal, or RTP error
