@@ -55,6 +55,12 @@ func LoadConfig(path string) (*Config, error) {
 	default:
 		return nil, fmt.Errorf("unsupported config type: %s", ext)
 	}
+	if cfg.SegmentSeconds <= 0 {
+		cfg.SegmentSeconds = 1800 // default 30 min
+	}
+	if cfg.ExtendMarginSeconds <= 0 {
+		cfg.ExtendMarginSeconds = 30 // default 30 sec
+	}
 	return &cfg, nil
 }
 
@@ -429,6 +435,10 @@ func (r *Recorder) negotiate(ctx context.Context) error {
 				go func() {
 					if err := r.startFFMPEG(); err != nil {
 						log.Println("[ERROR] startFFMPEG:", err)
+						select {
+						case r.errorChan <- fmt.Errorf("startFFMPEG: %w", err):
+						default:
+						}
 					}
 				}()
 			})
@@ -464,7 +474,11 @@ func (r *Recorder) negotiate(ctx context.Context) error {
 		SDP:  res.AnswerSDP,
 	})
 	r.mediaSessionID = res.MediaSession
-	r.streamExpires, _ = time.Parse(time.RFC3339, res.ExpiresAt)
+	exp, err := time.Parse(time.RFC3339, res.ExpiresAt)
+	if err != nil {
+		return fmt.Errorf("parse expiresAt %q: %w", res.ExpiresAt, err)
+	}
+	r.streamExpires = exp
 	log.Printf("[RTC] stream valid until %s", r.streamExpires.Format(time.RFC3339))
 	return nil
 }
@@ -483,7 +497,11 @@ func (r *Recorder) extend(ctx context.Context) error {
 		return err
 	}
 	r.mediaSessionID = res.MediaSession
-	r.streamExpires, _ = time.Parse(time.RFC3339, res.ExpiresAt)
+	exp, err := time.Parse(time.RFC3339, res.ExpiresAt)
+	if err != nil {
+		return fmt.Errorf("parse expiresAt %q: %w", res.ExpiresAt, err)
+	}
+	r.streamExpires = exp
 	log.Printf("[RTC] extended; valid until %s", r.streamExpires.Format(time.RFC3339))
 	return nil
 }
