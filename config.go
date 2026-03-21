@@ -1,0 +1,51 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"gopkg.in/yaml.v3"
+)
+
+// Config holds application settings loaded from a YAML or JSON file.
+type Config struct {
+	ClientID            string `json:"client_id"            yaml:"client_id"`
+	ClientSecret        string `json:"client_secret"        yaml:"client_secret"`
+	RefreshToken        string `json:"refresh_token"        yaml:"refresh_token"`
+	DeviceID            string `json:"device_id"            yaml:"device_id"`
+	OutputDir           string `json:"output_dir"           yaml:"output_dir"`
+	SegmentSeconds      int    `json:"segment_seconds"      yaml:"segment_seconds"`
+	ExtendMarginSeconds int    `json:"extend_margin_seconds" yaml:"extend_margin_seconds"`
+}
+
+func LoadConfig(path string) (*Config, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var cfg Config
+	switch ext := filepath.Ext(path); ext {
+	case ".yaml", ".yml":
+		if err = yaml.NewDecoder(f).Decode(&cfg); err != nil {
+			return nil, err
+		}
+	case ".json":
+		if err = json.NewDecoder(f).Decode(&cfg); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("unsupported config type: %s", ext)
+	}
+
+	if cfg.SegmentSeconds <= 0 {
+		cfg.SegmentSeconds = 1800 // default 30 min
+	}
+	if cfg.ExtendMarginSeconds <= 0 {
+		cfg.ExtendMarginSeconds = 30 // default 30 sec
+	}
+	return &cfg, nil
+}
