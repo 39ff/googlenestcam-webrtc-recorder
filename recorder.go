@@ -33,10 +33,12 @@ type Recorder struct {
 	streamExpires  time.Time
 	mu             sync.Mutex
 
-	startOnce sync.Once
-	errorChan chan error
-	ctx       context.Context
-	cancel    context.CancelFunc
+	startOnce  sync.Once
+	ffWaitOnce sync.Once
+	ffWaitErr  error
+	errorChan  chan error
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
 // NewRecorder creates a Recorder bound to the given context.
@@ -49,6 +51,14 @@ func NewRecorder(ctx context.Context, cfg *Config, sdm *SDMClient) *Recorder {
 		ctx:       recCtx,
 		cancel:    recCancel,
 	}
+}
+
+// waitFFmpeg calls Wait() on the ffmpeg process exactly once, returning the cached result.
+func (r *Recorder) waitFFmpeg() error {
+	r.ffWaitOnce.Do(func() {
+		r.ffWaitErr = r.ffmpeg.Wait()
+	})
+	return r.ffWaitErr
 }
 
 // freeUDPPort returns an available UDP port number.
@@ -129,7 +139,7 @@ func (r *Recorder) startFFMPEG() error {
 	}
 	segTemplate := filepath.Join(r.cfg.OutputDir, "%Y-%m-%d_%H-%M-%S.mp4")
 	vf := `drawtext=` +
-		`fontfile=/usr/share/DejaVuSansMono.ttf:` +
+		`fontfile=` + r.cfg.FontPath + `:` +
 		`expansion=strftime:` +
 		`text=%Y-%m-%d\ %H\\:%M\\:%S:` +
 		`x=w-text_w-20:y=h-text_h-20:` +
@@ -168,7 +178,7 @@ func (r *Recorder) startFFMPEG() error {
 
 	// Monitor ffmpeg process for unexpected termination
 	go func() {
-		err := ff.Wait()
+		err := r.waitFFmpeg()
 		if r.ctx.Err() != nil {
 			return // intentional shutdown
 		}
@@ -258,6 +268,8 @@ func (r *Recorder) Negotiate(ctx context.Context) error {
 	}
 	select {
 	case <-gather:
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-time.After(5 * time.Second):
 		return fmt.Errorf("ICE gathering timeout")
 	}
@@ -320,6 +332,6 @@ func (r *Recorder) Close() {
 	}
 	if r.ffmpeg != nil && r.ffmpeg.Process != nil {
 		_ = r.ffmpeg.Process.Signal(syscall.SIGINT)
-		_ = r.ffmpeg.Wait()
+		_ = r.waitFFmpeg()
 	}
 }

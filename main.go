@@ -45,14 +45,18 @@ func main() {
 			}
 			log.Println("[ERROR] negotiate:", err)
 			rec.Close()
-			time.Sleep(10 * time.Second)
+			if !sleepOrDone(ctx, 10*time.Second) {
+				return
+			}
 			continue
 		}
 
 		if exited := runExtendLoop(rec, ctx); exited {
 			return
 		}
-		time.Sleep(10 * time.Second)
+		if !sleepOrDone(ctx, 10*time.Second) {
+			return
+		}
 	}
 }
 
@@ -100,5 +104,17 @@ func runExtendLoop(rec *Recorder, ctx context.Context) bool {
 		case <-time.After(wait):
 			// Time to extend
 		}
+	}
+}
+
+// sleepOrDone waits for the given duration or until the context is cancelled.
+// Returns true if the sleep completed, false if cancelled.
+func sleepOrDone(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		log.Println("Exiting by signal")
+		return false
+	case <-time.After(d):
+		return true
 	}
 }

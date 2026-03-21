@@ -16,6 +16,7 @@ type Config struct {
 	RefreshToken        string `json:"refresh_token"        yaml:"refresh_token"`
 	DeviceID            string `json:"device_id"            yaml:"device_id"`
 	OutputDir           string `json:"output_dir"           yaml:"output_dir"`
+	FontPath            string `json:"font_path"            yaml:"font_path"`
 	SegmentSeconds      int    `json:"segment_seconds"      yaml:"segment_seconds"`
 	ExtendMarginSeconds int    `json:"extend_margin_seconds" yaml:"extend_margin_seconds"`
 }
@@ -55,6 +56,9 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("device_id is required")
 	}
 
+	if cfg.FontPath == "" {
+		cfg.FontPath = "/usr/share/DejaVuSansMono.ttf"
+	}
 	if cfg.SegmentSeconds <= 0 {
 		cfg.SegmentSeconds = 1800 // default 30 min
 	}
