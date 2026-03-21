@@ -75,6 +75,9 @@ func (r *Recorder) forwardRTP(track *webrtc.TrackRemote, conn *net.UDPConn, labe
 
 		pkt, _, err := track.ReadRTP()
 		if err != nil {
+			if r.ctx.Err() != nil {
+				return // intentional shutdown
+			}
 			log.Printf("[RTC] %s ReadRTP: %v", label, err)
 			select {
 			case r.errorChan <- fmt.Errorf("%s ReadRTP: %w", label, err):
@@ -88,6 +91,9 @@ func (r *Recorder) forwardRTP(track *webrtc.TrackRemote, conn *net.UDPConn, labe
 			continue
 		}
 		if _, err = conn.Write(raw); err != nil {
+			if r.ctx.Err() != nil {
+				return // intentional shutdown
+			}
 			log.Printf("[UDP] %s write: %v", label, err)
 			select {
 			case r.errorChan <- fmt.Errorf("%s UDP write: %w", label, err):
@@ -159,6 +165,19 @@ func (r *Recorder) startFFMPEG() error {
 
 	go r.forwardRTP(r.videoTrack, r.videoUDP, "video")
 	go r.forwardRTP(r.audioTrack, r.audioUDP, "audio")
+
+	// Monitor ffmpeg process for unexpected termination
+	go func() {
+		err := ff.Wait()
+		if r.ctx.Err() != nil {
+			return // intentional shutdown
+		}
+		log.Printf("[FFMPEG] process exited unexpectedly: %v", err)
+		select {
+		case r.errorChan <- fmt.Errorf("ffmpeg exited: %w", err):
+		default:
+		}
+	}()
 
 	return nil
 }

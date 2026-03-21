@@ -5,7 +5,6 @@ import (
 	"flag"
 	"log"
 	"net/http"
-	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -24,13 +23,14 @@ func main() {
 	auth := NewAuthClient(cfg, httpClient)
 	sdm := NewSDMClient(auth, httpClient, cfg.DeviceID)
 
-	ctx := context.Background()
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	// Signal-aware context so Negotiate() and other blocking calls
+	// are interrupted on SIGINT/SIGTERM.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	for {
 		select {
-		case <-sig:
+		case <-ctx.Done():
 			log.Println("Exiting by signal")
 			return
 		default:
@@ -38,20 +38,27 @@ func main() {
 
 		rec := NewRecorder(ctx, cfg, sdm)
 		if err := rec.Negotiate(rec.ctx); err != nil {
+			if ctx.Err() != nil {
+				log.Println("Exiting by signal")
+				rec.Close()
+				return
+			}
 			log.Println("[ERROR] negotiate:", err)
 			rec.Close()
 			time.Sleep(10 * time.Second)
 			continue
 		}
 
-		runExtendLoop(rec, sig)
+		if exited := runExtendLoop(rec, ctx); exited {
+			return
+		}
 		time.Sleep(10 * time.Second)
 	}
 }
 
 // runExtendLoop monitors the recording session, extending it before expiry
-// and restarting on errors or signals.
-func runExtendLoop(rec *Recorder, sig chan os.Signal) {
+// and restarting on errors or signals. Returns true if the program should exit.
+func runExtendLoop(rec *Recorder, ctx context.Context) bool {
 	margin := time.Duration(rec.cfg.ExtendMarginSeconds) * time.Second
 
 	for {
@@ -67,29 +74,29 @@ func runExtendLoop(rec *Recorder, sig chan os.Signal) {
 				if err != nil {
 					log.Println("[WARN] extend failed:", err, "-> renegotiate")
 					rec.Close()
-					return
+					return false
 				}
 				continue
-			case <-sig:
+			case <-ctx.Done():
 				log.Println("Exiting by signal")
 				rec.Close()
-				os.Exit(0)
+				return true
 			case rtpErr := <-rec.errorChan:
 				log.Printf("[ERROR] RTP stream failed: %v -> renegotiate", rtpErr)
 				rec.Close()
-				return
+				return false
 			}
 		}
 
 		select {
-		case <-sig:
+		case <-ctx.Done():
 			log.Println("Exiting by signal")
 			rec.Close()
-			os.Exit(0)
+			return true
 		case rtpErr := <-rec.errorChan:
 			log.Printf("[ERROR] RTP stream failed: %v -> renegotiate", rtpErr)
 			rec.Close()
-			return
+			return false
 		case <-time.After(wait):
 			// Time to extend
 		}

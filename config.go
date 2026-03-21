@@ -41,6 +41,20 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("unsupported config type: %s", ext)
 	}
 
+	// Validate required fields
+	if cfg.ClientID == "" {
+		return nil, fmt.Errorf("client_id is required")
+	}
+	if cfg.ClientSecret == "" {
+		return nil, fmt.Errorf("client_secret is required")
+	}
+	if cfg.RefreshToken == "" {
+		return nil, fmt.Errorf("refresh_token is required")
+	}
+	if cfg.DeviceID == "" {
+		return nil, fmt.Errorf("device_id is required")
+	}
+
 	if cfg.SegmentSeconds <= 0 {
 		cfg.SegmentSeconds = 1800 // default 30 min
 	}

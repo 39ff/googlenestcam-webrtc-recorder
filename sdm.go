@@ -22,7 +22,10 @@ func NewSDMClient(auth *AuthClient, httpClient *http.Client, deviceID string) *S
 
 func (s *SDMClient) executeCommand(ctx context.Context, command string, params any) (json.RawMessage, error) {
 	u := fmt.Sprintf("https://smartdevicemanagement.googleapis.com/v1/%s:executeCommand", s.deviceID)
-	body, _ := json.Marshal(map[string]any{"command": command, "params": params})
+	body, err := json.Marshal(map[string]any{"command": command, "params": params})
+	if err != nil {
+		return nil, fmt.Errorf("marshal SDM request: %w", err)
+	}
 
 	bearer, err := s.auth.Bearer(ctx)
 	if err != nil {
