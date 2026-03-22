@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -75,6 +76,9 @@ func freeUDPPort() (int, error) {
 // forwardRTP reads RTP packets from a WebRTC track and writes them to a UDP connection.
 // It stops when the context is cancelled and reports errors via errorChan.
 func (r *Recorder) forwardRTP(track *webrtc.TrackRemote, conn *net.UDPConn, label string) {
+	const maxRetries = 50 // up to ~5 seconds of connection-refused retries
+	connRefused := 0
+
 	for {
 		select {
 		case <-r.ctx.Done():
@@ -104,6 +108,12 @@ func (r *Recorder) forwardRTP(track *webrtc.TrackRemote, conn *net.UDPConn, labe
 			if r.ctx.Err() != nil {
 				return // intentional shutdown
 			}
+			// Retry on "connection refused" — ffmpeg may not be listening yet.
+			if isConnRefused(err) && connRefused < maxRetries {
+				connRefused++
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
 			log.Printf("[UDP] %s write: %v", label, err)
 			select {
 			case r.errorChan <- fmt.Errorf("%s UDP write: %w", label, err):
@@ -111,7 +121,20 @@ func (r *Recorder) forwardRTP(track *webrtc.TrackRemote, conn *net.UDPConn, labe
 			}
 			return
 		}
+		connRefused = 0 // reset once a write succeeds
 	}
+}
+
+// isConnRefused reports whether an error is a "connection refused" (ECONNREFUSED).
+func isConnRefused(err error) bool {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		var sysErr *os.SyscallError
+		if errors.As(opErr.Err, &sysErr) {
+			return errors.Is(sysErr.Err, syscall.ECONNREFUSED)
+		}
+	}
+	return false
 }
 
 // startFFMPEG is called once both video & audio tracks are available.
@@ -151,6 +174,8 @@ func (r *Recorder) startFFMPEG() error {
 		"-loglevel", "warning",
 		"-protocol_whitelist", "file,udp,rtp,pipe",
 		"-fflags", "+genpts",
+		"-analyzeduration", "2000000",
+		"-probesize", "10000000",
 		"-f", "sdp", "-i", "pipe:0",
 		"-vf", vf,
 		"-c:v", "libx264", "-preset", "veryfast",
@@ -171,7 +196,6 @@ func (r *Recorder) startFFMPEG() error {
 	_ = stdin.Close()
 	r.ffmpeg = ff
 	log.Printf("[FFMPEG] started pid %d", ff.Process.Pid)
-	time.Sleep(300 * time.Millisecond) // wait for ffmpeg to start listening
 
 	go r.forwardRTP(r.videoTrack, r.videoUDP, "video")
 	go r.forwardRTP(r.audioTrack, r.audioUDP, "audio")
