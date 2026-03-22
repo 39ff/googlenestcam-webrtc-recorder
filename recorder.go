@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -72,19 +73,15 @@ func freeUDPPort() (int, error) {
 	return p, nil
 }
 
-// waitUDPPortOpen blocks until ffmpeg has opened its UDP listener on the given
-// connected socket.  It sends tiny probe packets and checks the asynchronous
-// ICMP ECONNREFUSED error via getsockopt(SO_ERROR).  The probe bytes are too
-// small to form a valid RTP packet, so ffmpeg silently discards them.
-func waitUDPPortOpen(ctx context.Context, conn *net.UDPConn, timeout time.Duration) error {
-	raw, err := conn.SyscallConn()
-	if err != nil {
-		return fmt.Errorf("SyscallConn: %w", err)
-	}
+// waitUDPPortListening polls /proc/net/udp until the given port appears,
+// meaning ffmpeg has opened its UDP listener.  This avoids sending any probe
+// data that could corrupt ffmpeg's RTP sequence tracking.
+func waitUDPPortListening(ctx context.Context, port int, timeout time.Duration) error {
+	// Port number in /proc/net/udp is in hex, column 2 (local_address).
+	// Format: "  sl  local_address ..."  e.g. " 0: 0100007F:D4E6 ..."
+	target := fmt.Sprintf(":%04X ", port)
 
 	deadline := time.Now().Add(timeout)
-	probe := []byte{0}
-
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
@@ -92,26 +89,20 @@ func waitUDPPortOpen(ctx context.Context, conn *net.UDPConn, timeout time.Durati
 		default:
 		}
 
-		// Send a 1-byte probe; the kernel may queue an ICMP error.
-		_, _ = conn.Write(probe)
-		time.Sleep(50 * time.Millisecond)
-
-		// Read (and clear) any pending asynchronous socket error.
-		var errno int
-		_ = raw.Control(func(fd uintptr) {
-			errno, _ = syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_ERROR)
-		})
-		if errno == 0 {
-			return nil // no pending error → port is open
+		data, err := os.ReadFile("/proc/net/udp")
+		if err != nil {
+			return fmt.Errorf("read /proc/net/udp: %w", err)
 		}
-		// ECONNREFUSED or other transient error; keep trying.
-		time.Sleep(50 * time.Millisecond)
+		if strings.Contains(string(data), target) {
+			return nil
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
-	return fmt.Errorf("timeout after %v", timeout)
+	return fmt.Errorf("port %d not listening after %v", port, timeout)
 }
 
 // forwardRTP reads RTP packets from a WebRTC track and writes them to a UDP connection.
-// The caller must ensure the UDP port is already open (see waitUDPPortOpen).
+// The caller must ensure the UDP port is already open (see waitUDPPortListening).
 // It stops when the context is cancelled and reports errors via errorChan.
 func (r *Recorder) forwardRTP(track *webrtc.TrackRemote, conn *net.UDPConn, label string) {
 	for {
@@ -191,7 +182,6 @@ func (r *Recorder) startFFMPEG() error {
 		"-fflags", "+genpts",
 		"-analyzeduration", "2000000",
 		"-probesize", "10000000",
-		"-reorder_queue_size", "0",
 		"-f", "sdp", "-i", "pipe:0",
 		"-vf", vf,
 		"-c:v", "libx264", "-preset", "veryfast",
@@ -215,11 +205,13 @@ func (r *Recorder) startFFMPEG() error {
 
 	// Block until ffmpeg has opened both UDP listeners so the first
 	// RTP packets (containing H.264 SPS/PPS) are not silently dropped.
+	// Uses /proc/net/udp to detect without sending any probe data that
+	// would corrupt ffmpeg's RTP sequence tracking.
 	const portTimeout = 5 * time.Second
-	if err = waitUDPPortOpen(r.ctx, r.videoUDP, portTimeout); err != nil {
+	if err = waitUDPPortListening(r.ctx, r.videoPort, portTimeout); err != nil {
 		return fmt.Errorf("video port not ready: %w", err)
 	}
-	if err = waitUDPPortOpen(r.ctx, r.audioUDP, portTimeout); err != nil {
+	if err = waitUDPPortListening(r.ctx, r.audioPort, portTimeout); err != nil {
 		return fmt.Errorf("audio port not ready: %w", err)
 	}
 	log.Println("[FFMPEG] UDP ports ready, starting RTP forwarding")
