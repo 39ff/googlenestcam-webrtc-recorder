@@ -255,19 +255,22 @@ func (r *Recorder) Negotiate(ctx context.Context) error {
 
 	pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
 		log.Printf("[RTC] track arrived: %s pt=%d", track.Kind(), track.PayloadType())
+		r.mu.Lock()
 		switch track.Kind() {
 		case webrtc.RTPCodecTypeVideo:
-			r.videoTrack = track
 			if p, err := freeUDPPort(); err == nil {
 				r.videoPort = p
 			}
+			r.videoTrack = track
 		case webrtc.RTPCodecTypeAudio:
-			r.audioTrack = track
 			if p, err := freeUDPPort(); err == nil {
 				r.audioPort = p
 			}
+			r.audioTrack = track
 		}
-		if r.videoTrack != nil && r.audioTrack != nil {
+		ready := r.videoTrack != nil && r.audioTrack != nil
+		r.mu.Unlock()
+		if ready {
 			r.startOnce.Do(func() {
 				go func() {
 					if err := r.startFFMPEG(); err != nil {
