@@ -179,8 +179,7 @@ func (r *Recorder) startFFMPEG() error {
 	segTemplate := filepath.Join(r.cfg.OutputDir, "%Y-%m-%d_%H-%M-%S.mp4")
 	vf := `drawtext=` +
 		`fontfile=` + r.cfg.FontPath + `:` +
-		`expansion=strftime:` +
-		`text=%Y-%m-%d\ %H\\:%M\\:%S:` +
+		`text='%{localtime\:%Y-%m-%d %H\\\:%M\\\:%S}':` +
 		`x=w-text_w-20:y=h-text_h-20:` +
 		`fontsize=24:fontcolor=white:` +
 		`shadowcolor=black:shadowx=2:shadowy=2:` +
@@ -192,6 +191,7 @@ func (r *Recorder) startFFMPEG() error {
 		"-fflags", "+genpts",
 		"-analyzeduration", "2000000",
 		"-probesize", "10000000",
+		"-reorder_queue_size", "0",
 		"-f", "sdp", "-i", "pipe:0",
 		"-vf", vf,
 		"-c:v", "libx264", "-preset", "veryfast",
