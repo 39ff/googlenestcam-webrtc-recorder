@@ -77,24 +77,6 @@ func freeUDPPort() (int, error) {
 // It stops when the context is cancelled and reports errors via errorChan.
 func (r *Recorder) forwardRTP(track *webrtc.TrackRemote, conn *net.UDPConn, label string) {
 	const maxStartupRetries = 50 // up to ~5 seconds waiting for ffmpeg
-	startupRetries := 0
-
-	// Wait for ffmpeg to open its UDP listener before reading packets,
-	// so we don't lose initial SPS/PPS NAL units.
-	for startupRetries < maxStartupRetries {
-		select {
-		case <-r.ctx.Done():
-			return
-		default:
-		}
-		// Probe with a zero-length write to check if the port is open.
-		if _, err := conn.Write([]byte{}); err != nil && isConnRefused(err) {
-			startupRetries++
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-		break
-	}
 
 	for {
 		select {
@@ -121,10 +103,23 @@ func (r *Recorder) forwardRTP(track *webrtc.TrackRemote, conn *net.UDPConn, labe
 			log.Printf("[RTC] %s Marshal: %v", label, err)
 			continue
 		}
-		if _, err = conn.Write(raw); err != nil {
-			if r.ctx.Err() != nil {
-				return // intentional shutdown
+
+		// Retry writing the same packet if ffmpeg isn't listening yet.
+		written := false
+		for attempt := 0; attempt <= maxStartupRetries; attempt++ {
+			if _, err = conn.Write(raw); err == nil {
+				written = true
+				break
 			}
+			if r.ctx.Err() != nil {
+				return
+			}
+			if !isConnRefused(err) || attempt == maxStartupRetries {
+				break // non-recoverable error or exhausted retries
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if !written {
 			log.Printf("[UDP] %s write: %v", label, err)
 			select {
 			case r.errorChan <- fmt.Errorf("%s UDP write: %w", label, err):
