@@ -131,42 +131,96 @@ func waitUDPPortListening(ctx context.Context, port int, timeout time.Duration) 
 // forwardRTP reads RTP packets from a WebRTC track and writes them to a UDP connection.
 // The caller must ensure the UDP port is already open (see waitUDPPortListening).
 // It stops when the context is cancelled and reports errors via errorChan.
+//
+// On startup pion will have buffered RTP packets while ffmpeg was initialising.
+// Forwarding this burst overwhelms ffmpeg's RTP jitter buffer, causing
+// "dropping old packet" errors and decode failures.  To avoid this we drain
+// all packets that are immediately available (the burst), then begin
+// forwarding live packets at their natural arrival rate.  ffmpeg will
+// cleanly start decoding from the next keyframe after the drain.
 func (r *Recorder) forwardRTP(track *webrtc.TrackRemote, conn *net.UDPConn, label string) {
+	// Decouple blocking ReadRTP from select-based drain/forward logic.
+	type pktOrErr struct {
+		raw []byte
+		err error
+	}
+	ch := make(chan pktOrErr, 500)
+	go func() {
+		for {
+			pkt, _, err := track.ReadRTP()
+			if err != nil {
+				ch <- pktOrErr{err: err}
+				return
+			}
+			raw, merr := pkt.Marshal()
+			if merr != nil {
+				continue
+			}
+			ch <- pktOrErr{raw: raw}
+		}
+	}()
+
+	// Drain packets buffered in pion during ffmpeg startup (200ms).
+	// The burst is read in microseconds; we also discard a few live
+	// packets arriving during the window (~6 frames at 30 fps).
+	// After the drain ffmpeg receives packets at their natural rate
+	// and starts decoding cleanly from the next keyframe.
+	drainDone := time.After(200 * time.Millisecond)
+	drained := 0
+Drain:
 	for {
 		select {
 		case <-r.ctx.Done():
 			log.Printf("[RTC] %s forwarder stopped by context", label)
 			return
-		default:
+		case <-drainDone:
+			break Drain
+		case p := <-ch:
+			if p.err != nil {
+				if r.ctx.Err() != nil {
+					return
+				}
+				log.Printf("[RTC] %s ReadRTP: %v", label, p.err)
+				select {
+				case r.errorChan <- fmt.Errorf("%s ReadRTP: %w", label, p.err):
+				default:
+				}
+				return
+			}
+			drained++
 		}
+	}
+	log.Printf("[RTC] %s drained %d buffered packets", label, drained)
 
-		pkt, _, err := track.ReadRTP()
-		if err != nil {
-			if r.ctx.Err() != nil {
-				return // intentional shutdown
-			}
-			log.Printf("[RTC] %s ReadRTP: %v", label, err)
-			select {
-			case r.errorChan <- fmt.Errorf("%s ReadRTP: %w", label, err):
-			default:
-			}
+	// Forward live packets to ffmpeg.
+	for {
+		select {
+		case <-r.ctx.Done():
+			log.Printf("[RTC] %s forwarder stopped by context", label)
 			return
-		}
-		raw, err := pkt.Marshal()
-		if err != nil {
-			log.Printf("[RTC] %s Marshal: %v", label, err)
-			continue
-		}
-		if _, err = conn.Write(raw); err != nil {
-			if r.ctx.Err() != nil {
-				return // intentional shutdown
+		case p := <-ch:
+			if p.err != nil {
+				if r.ctx.Err() != nil {
+					return
+				}
+				log.Printf("[RTC] %s ReadRTP: %v", label, p.err)
+				select {
+				case r.errorChan <- fmt.Errorf("%s ReadRTP: %w", label, p.err):
+				default:
+				}
+				return
 			}
-			log.Printf("[UDP] %s write: %v", label, err)
-			select {
-			case r.errorChan <- fmt.Errorf("%s UDP write: %w", label, err):
-			default:
+			if _, err := conn.Write(p.raw); err != nil {
+				if r.ctx.Err() != nil {
+					return
+				}
+				log.Printf("[UDP] %s write: %v", label, err)
+				select {
+				case r.errorChan <- fmt.Errorf("%s UDP write: %w", label, err):
+				default:
+				}
+				return
 			}
-			return
 		}
 	}
 }
