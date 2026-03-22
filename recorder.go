@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -133,13 +134,14 @@ func waitUDPPortListening(ctx context.Context, port int, timeout time.Duration) 
 // It stops when the context is cancelled and reports errors via errorChan.
 //
 // On startup pion will have buffered RTP packets while ffmpeg was initialising.
-// Forwarding this burst overwhelms ffmpeg's RTP jitter buffer, causing
-// "dropping old packet" errors and decode failures.  To avoid this we drain
-// all packets that are immediately available (the burst), then begin
-// forwarding live packets at their natural arrival rate.  ffmpeg will
-// cleanly start decoding from the next keyframe after the drain.
+// Forwarding them as an instant burst overwhelms ffmpeg's RTP jitter buffer.
+// To avoid this we collect the buffered packets, sort them by RTP sequence
+// number (fixing any network reordering), and forward them with a small
+// inter-packet delay so ffmpeg can process them cleanly.  SPS/PPS and IDR
+// packets are preserved, so ffmpeg can initialise the H.264 decoder
+// immediately.
 func (r *Recorder) forwardRTP(track *webrtc.TrackRemote, conn *net.UDPConn, label string) {
-	// Decouple blocking ReadRTP from select-based drain/forward logic.
+	// Decouple blocking ReadRTP from select-based collect/forward logic.
 	type pktOrErr struct {
 		raw []byte
 		err error
@@ -160,21 +162,17 @@ func (r *Recorder) forwardRTP(track *webrtc.TrackRemote, conn *net.UDPConn, labe
 		}
 	}()
 
-	// Drain packets buffered in pion during ffmpeg startup (200ms).
-	// The burst is read in microseconds; we also discard a few live
-	// packets arriving during the window (~6 frames at 30 fps).
-	// After the drain ffmpeg receives packets at their natural rate
-	// and starts decoding cleanly from the next keyframe.
-	drainDone := time.After(200 * time.Millisecond)
-	drained := 0
-Drain:
+	// Collect packets buffered in pion during ffmpeg startup (200ms).
+	collectDone := time.After(200 * time.Millisecond)
+	var buffered [][]byte
+Collect:
 	for {
 		select {
 		case <-r.ctx.Done():
 			log.Printf("[RTC] %s forwarder stopped by context", label)
 			return
-		case <-drainDone:
-			break Drain
+		case <-collectDone:
+			break Collect
 		case p := <-ch:
 			if p.err != nil {
 				if r.ctx.Err() != nil {
@@ -187,12 +185,37 @@ Drain:
 				}
 				return
 			}
-			drained++
+			buffered = append(buffered, p.raw)
 		}
 	}
-	log.Printf("[RTC] %s drained %d buffered packets", label, drained)
 
-	// Forward live packets to ffmpeg.
+	// Sort buffered packets by RTP sequence number (bytes 2-3 of the
+	// RTP header) to correct any network reordering from the burst.
+	sort.Slice(buffered, func(i, j int) bool {
+		si := uint16(buffered[i][2])<<8 | uint16(buffered[i][3])
+		sj := uint16(buffered[j][2])<<8 | uint16(buffered[j][3])
+		return si < sj
+	})
+
+	// Forward buffered packets with 1ms spacing so ffmpeg's jitter
+	// buffer can absorb them without "dropping old packet" errors.
+	log.Printf("[RTC] %s forwarding %d buffered packets", label, len(buffered))
+	for _, raw := range buffered {
+		if _, err := conn.Write(raw); err != nil {
+			if r.ctx.Err() != nil {
+				return
+			}
+			log.Printf("[UDP] %s write: %v", label, err)
+			select {
+			case r.errorChan <- fmt.Errorf("%s UDP write: %w", label, err):
+			default:
+			}
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Forward live packets to ffmpeg at their natural arrival rate.
 	for {
 		select {
 		case <-r.ctx.Done():
