@@ -153,14 +153,6 @@ func (r *Recorder) startFFMPEG() error {
 	}
 
 	var err error
-	r.videoUDP, err = net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: r.videoPort})
-	if err != nil {
-		return fmt.Errorf("video DialUDP: %w", err)
-	}
-	r.audioUDP, err = net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: r.audioPort})
-	if err != nil {
-		return fmt.Errorf("audio DialUDP: %w", err)
-	}
 
 	sdp := generateUnifiedSDP(r.videoTrack, r.videoPort, r.audioTrack, r.audioPort)
 
@@ -207,6 +199,9 @@ func (r *Recorder) startFFMPEG() error {
 	// RTP packets (containing H.264 SPS/PPS) are not silently dropped.
 	// Uses /proc/net/udp to detect without sending any probe data that
 	// would corrupt ffmpeg's RTP sequence tracking.
+	// IMPORTANT: DialUDP must happen AFTER this check, because a connected
+	// UDP socket's remote-address field in /proc/net/udp would cause a
+	// false-positive match on the target port.
 	const portTimeout = 5 * time.Second
 	if err = waitUDPPortListening(r.ctx, r.videoPort, portTimeout); err != nil {
 		return fmt.Errorf("video port not ready: %w", err)
@@ -215,6 +210,16 @@ func (r *Recorder) startFFMPEG() error {
 		return fmt.Errorf("audio port not ready: %w", err)
 	}
 	log.Println("[FFMPEG] UDP ports ready, starting RTP forwarding")
+
+	// Now create the connected UDP sockets for forwarding.
+	r.videoUDP, err = net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: r.videoPort})
+	if err != nil {
+		return fmt.Errorf("video DialUDP: %w", err)
+	}
+	r.audioUDP, err = net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: r.audioPort})
+	if err != nil {
+		return fmt.Errorf("audio DialUDP: %w", err)
+	}
 
 	go r.forwardRTP(r.videoTrack, r.videoUDP, "video")
 	go r.forwardRTP(r.audioTrack, r.audioUDP, "audio")
