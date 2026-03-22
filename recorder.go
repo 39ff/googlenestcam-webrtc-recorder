@@ -78,8 +78,10 @@ func freeUDPPort() (int, error) {
 // sending any probe data that could corrupt ffmpeg's RTP sequence tracking.
 //
 // Two-phase approach:
-//  1. Wait for any stale entry to disappear (from freeUDPPort's recently-closed
-//     listener socket).
+//  1. Briefly wait for any stale entry to disappear (from freeUDPPort's
+//     recently-closed listener socket).  Capped at 200ms because kernel
+//     socket close is near-instant; if the port is still present after that,
+//     it is ffmpeg's real listener, not a stale entry.
 //  2. Wait for ffmpeg's new listener to appear.
 func waitUDPPortListening(ctx context.Context, port int, timeout time.Duration) error {
 	// Port number in /proc/net/udp is in hex, column 2 (local_address).
@@ -89,7 +91,11 @@ func waitUDPPortListening(ctx context.Context, port int, timeout time.Duration) 
 	deadline := time.Now().Add(timeout)
 
 	// Phase 1: drain any stale entry left by freeUDPPort's closed socket.
-	for time.Now().Before(deadline) {
+	// Cap at 200ms — if the port is still listed after that, it belongs to
+	// ffmpeg (which may have opened its listener while we were checking
+	// the other port), so fall through to phase 2 which will find it.
+	staleDeadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(staleDeadline) {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
