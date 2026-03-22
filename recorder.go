@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -9,8 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -74,136 +73,47 @@ func freeUDPPort() (int, error) {
 	return p, nil
 }
 
-// waitUDPPortListening polls /proc/net/udp until the given port appears as a
-// local-address, meaning ffmpeg has opened its UDP listener.  This avoids
-// sending any probe data that could corrupt ffmpeg's RTP sequence tracking.
-//
-// Two-phase approach:
-//  1. Briefly wait for any stale entry to disappear (from freeUDPPort's
-//     recently-closed listener socket).  Capped at 200ms because kernel
-//     socket close is near-instant; if the port is still present after that,
-//     it is ffmpeg's real listener, not a stale entry.
-//  2. Wait for ffmpeg's new listener to appear.
-func waitUDPPortListening(ctx context.Context, port int, timeout time.Duration) error {
-	// Port number in /proc/net/udp is in hex, column 2 (local_address).
-	// Format: "  sl  local_address ..."  e.g. " 0: 0100007F:D4E6 ..."
-	target := fmt.Sprintf(":%04X ", port)
-
-	deadline := time.Now().Add(timeout)
-
-	// Phase 1: drain any stale entry left by freeUDPPort's closed socket.
-	// Cap at 200ms — if the port is still listed after that, it belongs to
-	// ffmpeg (which may have opened its listener while we were checking
-	// the other port), so fall through to phase 2 which will find it.
-	staleDeadline := time.Now().Add(200 * time.Millisecond)
-	for time.Now().Before(staleDeadline) {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		data, _ := os.ReadFile("/proc/net/udp")
-		if !strings.Contains(string(data), target) {
-			break // stale entry is gone (or was never there)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	// Phase 2: wait for ffmpeg to open its listener on the port.
-	for time.Now().Before(deadline) {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		data, err := os.ReadFile("/proc/net/udp")
-		if err != nil {
-			return fmt.Errorf("read /proc/net/udp: %w", err)
-		}
-		if strings.Contains(string(data), target) {
-			return nil
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	return fmt.Errorf("port %d not listening after %v", port, timeout)
-}
-
-// forwardRTP reads RTP packets from a WebRTC track and writes them to a UDP connection.
-// The caller must ensure the UDP port is already open (see waitUDPPortListening).
-// It stops when the context is cancelled and reports errors via errorChan.
-//
-// On startup pion will have buffered RTP packets while ffmpeg was initialising.
-// Forwarding them as an instant burst overwhelms ffmpeg's RTP jitter buffer.
-// To avoid this we collect the buffered packets, sort them by RTP sequence
-// number (fixing any network reordering), and forward them with a small
-// inter-packet delay so ffmpeg can process them cleanly.  SPS/PPS and IDR
-// packets are preserved, so ffmpeg can initialise the H.264 decoder
-// immediately.
+// forwardRTP reads RTP packets from a WebRTC track and writes them to a UDP
+// connection.  ECONNREFUSED errors are silently skipped — they occur while
+// ffmpeg is still opening its UDP listeners.  Once ffmpeg is ready the writes
+// succeed and the stream flows normally.  A few initial packets (including
+// SPS/PPS) may be lost, but the camera resends them with the next keyframe.
 func (r *Recorder) forwardRTP(track *webrtc.TrackRemote, conn *net.UDPConn, label string) {
-	// Decouple blocking ReadRTP from select-based collect/forward logic.
-	type pktOrErr struct {
-		raw []byte
-		err error
-	}
-	ch := make(chan pktOrErr, 500)
-	go func() {
-		for {
-			pkt, _, err := track.ReadRTP()
-			if err != nil {
-				ch <- pktOrErr{err: err}
-				return
-			}
-			raw, merr := pkt.Marshal()
-			if merr != nil {
-				continue
-			}
-			ch <- pktOrErr{raw: raw}
-		}
-	}()
-
-	// Collect packets buffered in pion during ffmpeg startup (200ms).
-	collectDone := time.After(200 * time.Millisecond)
-	var buffered [][]byte
-Collect:
 	for {
 		select {
 		case <-r.ctx.Done():
 			log.Printf("[RTC] %s forwarder stopped by context", label)
 			return
-		case <-collectDone:
-			break Collect
-		case p := <-ch:
-			if p.err != nil {
-				if r.ctx.Err() != nil {
-					return
-				}
-				log.Printf("[RTC] %s ReadRTP: %v", label, p.err)
-				select {
-				case r.errorChan <- fmt.Errorf("%s ReadRTP: %w", label, p.err):
-				default:
-				}
-				return
-			}
-			buffered = append(buffered, p.raw)
+		default:
 		}
-	}
 
-	// Sort buffered packets by RTP sequence number (bytes 2-3 of the
-	// RTP header) to correct any network reordering from the burst.
-	sort.Slice(buffered, func(i, j int) bool {
-		si := uint16(buffered[i][2])<<8 | uint16(buffered[i][3])
-		sj := uint16(buffered[j][2])<<8 | uint16(buffered[j][3])
-		return si < sj
-	})
-
-	// Forward buffered packets with 1ms spacing so ffmpeg's jitter
-	// buffer can absorb them without "dropping old packet" errors.
-	log.Printf("[RTC] %s forwarding %d buffered packets", label, len(buffered))
-	for _, raw := range buffered {
-		if _, err := conn.Write(raw); err != nil {
+		pkt, _, err := track.ReadRTP()
+		if err != nil {
 			if r.ctx.Err() != nil {
 				return
+			}
+			log.Printf("[RTC] %s ReadRTP: %v", label, err)
+			select {
+			case r.errorChan <- fmt.Errorf("%s ReadRTP: %w", label, err):
+			default:
+			}
+			return
+		}
+		raw, err := pkt.Marshal()
+		if err != nil {
+			log.Printf("[RTC] %s Marshal: %v", label, err)
+			continue
+		}
+		if _, err = conn.Write(raw); err != nil {
+			if r.ctx.Err() != nil {
+				return
+			}
+			// While ffmpeg is still initialising its UDP listeners the
+			// kernel returns ECONNREFUSED.  Skip these silently — the
+			// stream will recover from the next keyframe once ffmpeg is
+			// ready.
+			if errors.Is(err, syscall.ECONNREFUSED) {
+				continue
 			}
 			log.Printf("[UDP] %s write: %v", label, err)
 			select {
@@ -211,39 +121,6 @@ Collect:
 			default:
 			}
 			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-
-	// Forward live packets to ffmpeg at their natural arrival rate.
-	for {
-		select {
-		case <-r.ctx.Done():
-			log.Printf("[RTC] %s forwarder stopped by context", label)
-			return
-		case p := <-ch:
-			if p.err != nil {
-				if r.ctx.Err() != nil {
-					return
-				}
-				log.Printf("[RTC] %s ReadRTP: %v", label, p.err)
-				select {
-				case r.errorChan <- fmt.Errorf("%s ReadRTP: %w", label, p.err):
-				default:
-				}
-				return
-			}
-			if _, err := conn.Write(p.raw); err != nil {
-				if r.ctx.Err() != nil {
-					return
-				}
-				log.Printf("[UDP] %s write: %v", label, err)
-				select {
-				case r.errorChan <- fmt.Errorf("%s UDP write: %w", label, err):
-				default:
-				}
-				return
-			}
 		}
 	}
 }
@@ -257,6 +134,14 @@ func (r *Recorder) startFFMPEG() error {
 	}
 
 	var err error
+	r.videoUDP, err = net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: r.videoPort})
+	if err != nil {
+		return fmt.Errorf("video DialUDP: %w", err)
+	}
+	r.audioUDP, err = net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: r.audioPort})
+	if err != nil {
+		return fmt.Errorf("audio DialUDP: %w", err)
+	}
 
 	sdp := generateUnifiedSDP(r.videoTrack, r.videoPort, r.audioTrack, r.audioPort)
 
@@ -299,32 +184,10 @@ func (r *Recorder) startFFMPEG() error {
 	r.ffmpeg = ff
 	log.Printf("[FFMPEG] started pid %d", ff.Process.Pid)
 
-	// Block until ffmpeg has opened both UDP listeners so the first
-	// RTP packets (containing H.264 SPS/PPS) are not silently dropped.
-	// Uses /proc/net/udp to detect without sending any probe data that
-	// would corrupt ffmpeg's RTP sequence tracking.
-	// IMPORTANT: DialUDP must happen AFTER this check, because a connected
-	// UDP socket's remote-address field in /proc/net/udp would cause a
-	// false-positive match on the target port.
-	const portTimeout = 5 * time.Second
-	if err = waitUDPPortListening(r.ctx, r.videoPort, portTimeout); err != nil {
-		return fmt.Errorf("video port not ready: %w", err)
-	}
-	if err = waitUDPPortListening(r.ctx, r.audioPort, portTimeout); err != nil {
-		return fmt.Errorf("audio port not ready: %w", err)
-	}
-	log.Println("[FFMPEG] UDP ports ready, starting RTP forwarding")
-
-	// Now create the connected UDP sockets for forwarding.
-	r.videoUDP, err = net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: r.videoPort})
-	if err != nil {
-		return fmt.Errorf("video DialUDP: %w", err)
-	}
-	r.audioUDP, err = net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: r.audioPort})
-	if err != nil {
-		return fmt.Errorf("audio DialUDP: %w", err)
-	}
-
+	// Start forwarding immediately.  The first few writes may get
+	// ECONNREFUSED while ffmpeg opens its UDP ports — forwardRTP
+	// silently skips those.  No port-probing or packet buffering
+	// needed.
 	go r.forwardRTP(r.videoTrack, r.videoUDP, "video")
 	go r.forwardRTP(r.audioTrack, r.audioUDP, "audio")
 
