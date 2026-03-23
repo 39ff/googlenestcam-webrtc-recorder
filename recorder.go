@@ -164,6 +164,7 @@ func (r *Recorder) startFFMPEG() error {
 		"-analyzeduration", "2000000",
 		"-probesize", "10000000",
 		"-f", "sdp", "-i", "pipe:0",
+		"-vsync", "0",
 		"-vf", vf,
 		"-c:v", "libx264", "-preset", "veryfast",
 		"-c:a", "aac",
