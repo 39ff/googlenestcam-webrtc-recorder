@@ -167,8 +167,9 @@ func (r *Recorder) startFFMPEG() error {
 		"-vf", vf,
 		"-c:v", "libx264", "-preset", "veryfast",
 		"-c:a", "aac",
-		"-movflags", "+faststart", "-reset_timestamps", "1",
-		"-f", "segment", "-segment_time", fmt.Sprint(r.cfg.SegmentSeconds), "-strftime", "1",
+		"-reset_timestamps", "1",
+		"-f", "segment", "-segment_format", "mp4",
+		"-segment_time", fmt.Sprint(r.cfg.SegmentSeconds), "-strftime", "1",
 		segTemplate,
 	)
 	stdin, err := ff.StdinPipe()
