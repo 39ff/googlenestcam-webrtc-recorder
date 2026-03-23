@@ -160,7 +160,7 @@ func (r *Recorder) startFFMPEG() error {
 	ff := exec.Command("ffmpeg",
 		"-loglevel", "warning",
 		"-protocol_whitelist", "file,udp,rtp,pipe",
-		"-fflags", "+genpts+igndts",
+		"-fflags", "+genpts",
 		"-analyzeduration", "2000000",
 		"-probesize", "10000000",
 		"-reorder_queue_size", "0",
