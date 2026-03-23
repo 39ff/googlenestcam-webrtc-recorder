@@ -159,8 +159,8 @@ func (r *Recorder) startFFMPEG() error {
 
 	ff := exec.Command("ffmpeg",
 		"-loglevel", "warning",
+		"-use_wallclock_as_timestamps", "1",
 		"-protocol_whitelist", "file,udp,rtp,pipe",
-		"-fflags", "+genpts",
 		"-analyzeduration", "2000000",
 		"-probesize", "10000000",
 		"-f", "sdp", "-i", "pipe:0",
