@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -72,8 +73,11 @@ func freeUDPPort() (int, error) {
 	return p, nil
 }
 
-// forwardRTP reads RTP packets from a WebRTC track and writes them to a UDP connection.
-// It stops when the context is cancelled and reports errors via errorChan.
+// forwardRTP reads RTP packets from a WebRTC track and writes them to a UDP
+// connection.  ECONNREFUSED errors are silently skipped — they occur while
+// ffmpeg is still opening its UDP listeners.  Once ffmpeg is ready the writes
+// succeed and the stream flows normally.  A few initial packets (including
+// SPS/PPS) may be lost, but the camera resends them with the next keyframe.
 func (r *Recorder) forwardRTP(track *webrtc.TrackRemote, conn *net.UDPConn, label string) {
 	for {
 		select {
@@ -86,7 +90,7 @@ func (r *Recorder) forwardRTP(track *webrtc.TrackRemote, conn *net.UDPConn, labe
 		pkt, _, err := track.ReadRTP()
 		if err != nil {
 			if r.ctx.Err() != nil {
-				return // intentional shutdown
+				return
 			}
 			log.Printf("[RTC] %s ReadRTP: %v", label, err)
 			select {
@@ -102,7 +106,14 @@ func (r *Recorder) forwardRTP(track *webrtc.TrackRemote, conn *net.UDPConn, labe
 		}
 		if _, err = conn.Write(raw); err != nil {
 			if r.ctx.Err() != nil {
-				return // intentional shutdown
+				return
+			}
+			// While ffmpeg is still initialising its UDP listeners the
+			// kernel returns ECONNREFUSED.  Skip these silently — the
+			// stream will recover from the next keyframe once ffmpeg is
+			// ready.
+			if errors.Is(err, syscall.ECONNREFUSED) {
+				continue
 			}
 			log.Printf("[UDP] %s write: %v", label, err)
 			select {
@@ -140,8 +151,7 @@ func (r *Recorder) startFFMPEG() error {
 	segTemplate := filepath.Join(r.cfg.OutputDir, "%Y-%m-%d_%H-%M-%S.mp4")
 	vf := `drawtext=` +
 		`fontfile=` + r.cfg.FontPath + `:` +
-		`expansion=strftime:` +
-		`text=%Y-%m-%d\ %H\\:%M\\:%S:` +
+		`text='%{localtime\:%Y-%m-%d %H\\\:%M\\\:%S}':` +
 		`x=w-text_w-20:y=h-text_h-20:` +
 		`fontsize=24:fontcolor=white:` +
 		`shadowcolor=black:shadowx=2:shadowy=2:` +
@@ -151,12 +161,19 @@ func (r *Recorder) startFFMPEG() error {
 		"-loglevel", "warning",
 		"-protocol_whitelist", "file,udp,rtp,pipe",
 		"-fflags", "+genpts",
+		"-analyzeduration", "2000000",
+		"-probesize", "10000000",
+		"-reorder_queue_size", "0",
 		"-f", "sdp", "-i", "pipe:0",
+		"-fps_mode", "passthrough",
 		"-vf", vf,
+		"-af", "aresample=async=1",
 		"-c:v", "libx264", "-preset", "veryfast",
 		"-c:a", "aac",
-		"-movflags", "+faststart", "-reset_timestamps", "1",
-		"-f", "segment", "-segment_time", fmt.Sprint(r.cfg.SegmentSeconds), "-strftime", "1",
+		"-reset_timestamps", "1",
+		"-max_muxing_queue_size", "4096",
+		"-f", "segment", "-segment_format", "mp4",
+		"-segment_time", fmt.Sprint(r.cfg.SegmentSeconds), "-strftime", "1",
 		segTemplate,
 	)
 	stdin, err := ff.StdinPipe()
@@ -171,8 +188,11 @@ func (r *Recorder) startFFMPEG() error {
 	_ = stdin.Close()
 	r.ffmpeg = ff
 	log.Printf("[FFMPEG] started pid %d", ff.Process.Pid)
-	time.Sleep(300 * time.Millisecond) // wait for ffmpeg to start listening
 
+	// Start forwarding immediately.  The first few writes may get
+	// ECONNREFUSED while ffmpeg opens its UDP ports — forwardRTP
+	// silently skips those.  No port-probing or packet buffering
+	// needed.
 	go r.forwardRTP(r.videoTrack, r.videoUDP, "video")
 	go r.forwardRTP(r.audioTrack, r.audioUDP, "audio")
 
@@ -231,19 +251,22 @@ func (r *Recorder) Negotiate(ctx context.Context) error {
 
 	pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
 		log.Printf("[RTC] track arrived: %s pt=%d", track.Kind(), track.PayloadType())
+		r.mu.Lock()
 		switch track.Kind() {
 		case webrtc.RTPCodecTypeVideo:
-			r.videoTrack = track
 			if p, err := freeUDPPort(); err == nil {
 				r.videoPort = p
 			}
+			r.videoTrack = track
 		case webrtc.RTPCodecTypeAudio:
-			r.audioTrack = track
 			if p, err := freeUDPPort(); err == nil {
 				r.audioPort = p
 			}
+			r.audioTrack = track
 		}
-		if r.videoTrack != nil && r.audioTrack != nil {
+		ready := r.videoTrack != nil && r.audioTrack != nil
+		r.mu.Unlock()
+		if ready {
 			r.startOnce.Do(func() {
 				go func() {
 					if err := r.startFFMPEG(); err != nil {
