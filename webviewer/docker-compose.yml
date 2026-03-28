@@ -1,0 +1,13 @@
+services:
+  webviewer:
+    build:
+      context: ..
+      dockerfile: webviewer/Dockerfile
+    container_name: nest-webviewer
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      TZ: "Asia/Tokyo"
+    volumes:
+      - ../recordings:/recordings:ro
