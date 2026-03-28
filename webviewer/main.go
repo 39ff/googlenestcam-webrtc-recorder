@@ -126,57 +126,138 @@ const indexHTML = `<!DOCTYPE html>
 <title>Nest Cam Recordings</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f0f0f; color: #e0e0e0; }
-  header { background: #1a1a2e; padding: 16px 24px; border-bottom: 1px solid #333; }
-  header h1 { font-size: 1.3rem; font-weight: 600; }
-  .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
-  .player-section { margin-bottom: 32px; display: none; }
-  .player-section.active { display: block; }
-  .player-section h2 { font-size: 1rem; margin-bottom: 12px; color: #aaa; }
-  .player-section .filename { color: #fff; font-weight: 600; }
-  video { width: 100%; max-height: 70vh; background: #000; border-radius: 8px; }
-  .recording-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
-  .recording-item {
-    background: #1a1a2e; border: 1px solid #2a2a3e; border-radius: 8px;
-    padding: 16px; cursor: pointer; transition: background 0.15s, border-color 0.15s;
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f0f0f; color: #e0e0e0; height: 100vh; overflow: hidden; }
+
+  .layout { display: flex; height: 100vh; }
+
+  /* --- Sidebar --- */
+  .sidebar {
+    width: 280px; min-width: 220px; max-width: 360px;
+    background: #1a1a2e; border-right: 1px solid #333;
+    display: flex; flex-direction: column; flex-shrink: 0;
   }
-  .recording-item:hover { background: #252540; border-color: #4a4a6e; }
-  .recording-item.active { border-color: #6366f1; background: #1e1e3a; }
-  .recording-item .name { font-size: 0.95rem; font-weight: 500; margin-bottom: 4px; }
-  .recording-item .meta { font-size: 0.8rem; color: #888; }
-  .empty { text-align: center; padding: 60px 20px; color: #666; }
+  .sidebar-header {
+    padding: 16px; border-bottom: 1px solid #333;
+    font-size: 1.1rem; font-weight: 600;
+  }
+  .sidebar-filter {
+    padding: 8px 12px; border-bottom: 1px solid #2a2a3e;
+  }
+  .sidebar-filter input {
+    width: 100%; padding: 6px 10px; border-radius: 4px;
+    border: 1px solid #333; background: #12121e; color: #e0e0e0;
+    font-size: 0.85rem; outline: none;
+  }
+  .sidebar-filter input:focus { border-color: #6366f1; }
+  .file-list {
+    flex: 1; overflow-y: auto; padding: 4px 0;
+  }
+  .file-list::-webkit-scrollbar { width: 6px; }
+  .file-list::-webkit-scrollbar-thumb { background: #444; border-radius: 3px; }
+  .file-item {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 10px 16px; cursor: pointer;
+    border-left: 3px solid transparent;
+    transition: background 0.12s, border-color 0.12s;
+    font-size: 0.85rem;
+  }
+  .file-item:hover { background: #252540; }
+  .file-item.active { background: #1e1e3a; border-left-color: #6366f1; }
+  .file-item .fname { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
+  .file-item .fsize { color: #666; font-size: 0.75rem; margin-left: 8px; flex-shrink: 0; }
+  .file-count { padding: 10px 16px; font-size: 0.75rem; color: #555; border-top: 1px solid #2a2a3e; }
+
+  /* --- Main content --- */
+  .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  .main-header {
+    padding: 12px 24px; border-bottom: 1px solid #333; background: #141420;
+    font-size: 0.9rem; color: #888; min-height: 46px; display: flex; align-items: center;
+  }
+  .main-header .filename { color: #fff; font-weight: 600; margin-left: 6px; }
+  .player-wrap {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    background: #000; padding: 16px; overflow: hidden;
+  }
+  video { max-width: 100%; max-height: 100%; border-radius: 4px; background: #000; }
+  .placeholder {
+    color: #444; font-size: 1.1rem; text-align: center;
+  }
 </style>
 </head>
 <body>
-<header><h1>Nest Cam Recordings</h1></header>
-<div class="container">
-  <div class="player-section" id="player-section">
-    <h2>Now Playing: <span class="filename" id="now-playing"></span></h2>
-    <video id="player" controls autoplay></video>
-  </div>
-  <div class="recording-list" id="list">
-    {{if not .}}
-    <div class="empty">No recordings found.</div>
-    {{end}}
-    {{range .}}
-    <div class="recording-item" data-name="{{.Name}}" onclick="play(this)">
-      <div class="name">{{.Name}}</div>
-      <div class="meta">{{printf "%.1f" (divMB .Size)}} MB</div>
+<div class="layout">
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="sidebar-header">Recordings</div>
+    <div class="sidebar-filter">
+      <input type="text" id="filter" placeholder="Filter..." oninput="filterList()">
     </div>
-    {{end}}
+    <div class="file-list" id="file-list">
+      {{if not .}}<div style="padding:40px 16px;color:#555;text-align:center">No recordings found.</div>{{end}}
+      {{range .}}
+      <div class="file-item" data-name="{{.Name}}" onclick="play(this)">
+        <span class="fname">{{.Name}}</span>
+        <span class="fsize">{{printf "%.1f" (divMB .Size)}} MB</span>
+      </div>
+      {{end}}
+    </div>
+    <div class="file-count" id="file-count"></div>
+  </div>
+
+  <!-- Main -->
+  <div class="main">
+    <div class="main-header">
+      <span id="now-playing-label" style="display:none">Now Playing:</span>
+      <span class="filename" id="now-playing"></span>
+    </div>
+    <div class="player-wrap">
+      <div class="placeholder" id="placeholder">Select a recording to play</div>
+      <video id="player" controls style="display:none"></video>
+    </div>
   </div>
 </div>
+
 <script>
+var allItems = document.querySelectorAll('.file-item');
+updateCount(allItems.length);
+
+function updateCount(visible) {
+  document.getElementById('file-count').textContent = visible + ' / ' + allItems.length + ' files';
+}
+
+function filterList() {
+  var q = document.getElementById('filter').value.toLowerCase();
+  var visible = 0;
+  allItems.forEach(function(el) {
+    var match = el.dataset.name.toLowerCase().indexOf(q) !== -1;
+    el.style.display = match ? '' : 'none';
+    if (match) visible++;
+  });
+  updateCount(visible);
+}
+
 function play(el) {
-  document.querySelectorAll('.recording-item').forEach(e => e.classList.remove('active'));
+  allItems.forEach(function(e) { e.classList.remove('active'); });
   el.classList.add('active');
   var name = el.dataset.name;
   var player = document.getElementById('player');
   player.src = '/video/' + encodeURIComponent(name);
+  player.style.display = '';
+  document.getElementById('placeholder').style.display = 'none';
   document.getElementById('now-playing').textContent = name;
-  document.getElementById('player-section').classList.add('active');
+  document.getElementById('now-playing-label').style.display = '';
   player.play();
 }
+
+// Keyboard: arrow up/down to navigate, Enter to play
+document.addEventListener('keydown', function(e) {
+  if (e.target.tagName === 'INPUT') return;
+  var items = Array.from(allItems).filter(function(el) { return el.style.display !== 'none'; });
+  if (!items.length) return;
+  var idx = items.findIndex(function(el) { return el.classList.contains('active'); });
+  if (e.key === 'ArrowDown') { e.preventDefault(); play(items[Math.min(idx + 1, items.length - 1)]); items[Math.min(idx + 1, items.length - 1)].scrollIntoView({block:'nearest'}); }
+  if (e.key === 'ArrowUp')   { e.preventDefault(); play(items[Math.max(idx - 1, 0)]); items[Math.max(idx - 1, 0)].scrollIntoView({block:'nearest'}); }
+});
 </script>
 </body>
 </html>
